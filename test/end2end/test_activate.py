@@ -81,6 +81,11 @@ class TestDeactivate(TestCase):
             deactivation_points=[message.msg_type],
             final_session=final_session,
             activation_points=["intent.service.skills.activated"],
+            # this scenario is a plain bus event, NOT an utterance: no pipeline
+            # runs, so PIPELINE-1 §9.5 ``ovos.utterance.handled`` (the ovoscope
+            # default end-marker) is never emitted and must not be waited for.
+            # The skill's own activation ack is the terminal message here.
+            eof_msgs=[f"{self.skill_id}.activate"],
             # messages internal to ovos-core, i.e. would not be sent to clients such as hivemind
             keep_original_src=[
                 #"intent.service.skills.activate", # TODO
@@ -123,6 +128,8 @@ class TestDeactivate(TestCase):
             final_session=final_session,
             activation_points=[message.msg_type], # starts activated
             deactivation_points=["intent.service.skills.deactivated"],
+            # plain bus event, not an utterance — see test_activate above.
+            eof_msgs=[f"{self.skill_id}.deactivate"],
             # messages internal to ovos-core, i.e. would not be sent to clients such as hivemind
             keep_original_src=[
                 #"intent.service.skills.deactivate", # TODO
@@ -168,12 +175,12 @@ class TestDeactivate(TestCase):
                           {"utterances": ["deactivate skill from within converse"], "lang": session.lang},
                           {"session": session.serialize(), "source": "A", "destination": "B"})
 
-        # the skill deactivates itself inside converse, but the converse
-        # pipeline re-activates it after handling the converse response, so it
-        # ends the utterance active again (identical on both namespace paths).
+        # the skill deactivates itself inside converse, so the session ends
+        # with the skill inactive (no re-activation — the skill explicitly
+        # requested deactivation).
         final_session = Session("123")
         final_session.lang = "en-US"
-        final_session.active_skills = [(self.skill_id, 0.0)]
+        final_session.active_skills = []
 
         test = End2EndTest(
             minicroft=minicroft,

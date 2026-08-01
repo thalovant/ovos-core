@@ -19,7 +19,6 @@ import time
 from threading import Thread, Event
 from typing import Callable, List, Optional
 
-from ovos_bus_client.apis.enclosure import EnclosureAPI
 from ovos_bus_client.client import MessageBusClient
 from ovos_bus_client.message import Message
 from ovos_bus_client.util.scheduler import EventScheduler
@@ -127,7 +126,6 @@ class SkillManager(Thread):
         self.plugin_skills = {}
         self._plugin_skills_lock = threading.RLock()
         self._loading_plugin_skills = set()
-        self.enclosure = EnclosureAPI(bus)
         self.num_install_retries = 0
         self.empty_skill_dirs = set()  # Save a record of empty skill dirs.
 
@@ -579,19 +577,15 @@ class SkillManager(Thread):
         loaded_new = self.load_plugin_skills(network=network, internet=internet)
 
         if loaded_new:
+            # Pipeline engines consume intent registrations as they arrive;
+            # engines with a deferred training step (e.g. padatious) train on
+            # this request. It is fire-and-forget: no reply topic is part of
+            # the spec, a single responder could not speak for every loaded
+            # pipeline, and most engines have nothing pending — so blocking
+            # here only stalled boot until a timeout on installs without a
+            # deferred-training engine.
             LOG.debug("Requesting pipeline intent training")
-            try:
-                response = self.bus.wait_for_response(Message("mycroft.skills.train"),
-                                                      "mycroft.skills.trained",
-                                                      timeout=60)  # 60 second timeout
-                if not response:
-                    LOG.error("Intent training timed out")
-                elif response.data.get('error'):
-                    LOG.error(f"Intent training failed: {response.data['error']}")
-                else:
-                    LOG.debug(f"pipelines trained and ready to go")
-            except Exception as e:
-                LOG.exception(f"Error during Intent training: {e}")
+            self.bus.emit(Message("mycroft.skills.train"))
 
     def _unload_plugin_skill(self, skill_id: str) -> None:
         """Unload a plugin skill.

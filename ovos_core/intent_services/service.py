@@ -29,6 +29,9 @@ from ovos_spec_tools import closest_lang, standardize_lang, SpecMessage
 from ovos_utils.log import LOG
 from ovos_utils.metrics import Stopwatch
 from ovos_utils.process_utils import ProcessStatus, StatusCallbackMap
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+
 from ovos_utils.thread_utils import create_daemon
 
 from ovos_core.transformers import MetadataTransformersService, UtteranceTransformersService, IntentTransformersService
@@ -174,7 +177,30 @@ class IntentService:
 
         # internal, track skills that call self.deactivate to avoid reactivating them again
         self._deactivations: defaultdict = defaultdict(list)
+        # Guards structural mutation of ``_deactivations`` so the concurrent
+        # pipeline (below) cannot corrupt the dict when two sessions are in
+        # flight at once.
+        self._deactivations_lock = Lock()
         self.bus.on('intent.service.skills.deactivate', self._handle_deactivate)
+
+        # PERF: optional concurrent pipeline. A synchronous OVOS runtime
+        # processes utterances one at a time on the bus handler thread, so a
+        # fleet of satellites sharing a runtime queues behind each other -- the
+        # dominant latency under load (measured: 25 clients/runtime gives ~19s
+        # p95 vs ~4s at 12.5). ``pipeline_workers`` > 1 runs the pipeline on a
+        # bounded pool instead, serialized per session (same session stays
+        # ordered, different sessions run in parallel). Defaults to 1: the
+        # inline path below is then byte-identical to the original behaviour.
+        # Enable only after auditing the loaded pipeline plugins for
+        # thread-safety and validating on a single-runtime canary.
+        _workers = max(1, int(self.config.get("pipeline_workers", 1)))
+        self._pipeline_executor = (
+            ThreadPoolExecutor(max_workers=_workers,
+                               thread_name_prefix="intent-pipeline")
+            if _workers > 1 else None
+        )
+        self._session_locks: dict = {}
+        self._session_locks_guard = Lock()
         self.bus.on('intent.service.pipelines.reload', self.handle_reload_pipelines)
 
         self.status.set_alive()
@@ -353,7 +379,10 @@ class IntentService:
         """
         sess = SessionManager.get(message)
         skill_id = message.data.get("skill_id")
-        self._deactivations[sess.session_id].append(skill_id)
+        # append under the guard: a concurrent pipeline for a different session
+        # may be resizing the dict at the same moment.
+        with self._deactivations_lock:
+            self._deactivations[sess.session_id].append(skill_id)
 
     def _emit_utterance_handled(self, dispatch_msg: Message):
         """OVOS-PIPELINE-1 §9.5 — emit the universal ``ovos.utterance.handled``
@@ -578,6 +607,42 @@ class IntentService:
         self.bus.emit(message.reply(SpecMessage.UTTERANCE_HANDLED))
 
     def handle_utterance(self, message: Message):
+        """Entrypoint for user utterances (bus handler for OVOS-PIPELINE §5.1).
+
+        Dispatches to :meth:`_run_pipeline`. With ``pipeline_workers`` == 1
+        (default) this is a direct inline call -- identical to the historical
+        behaviour. With more workers the pipeline runs on a bounded pool so
+        concurrent satellites do not serialize on the single bus thread; work
+        is serialized per session so same-session ordering and the per-session
+        ``_deactivations`` state are preserved.
+        """
+        if self._pipeline_executor is None:
+            return self._run_pipeline(message)
+        self._pipeline_executor.submit(self._run_pipeline_serialized, message)
+        return None
+
+    def _session_lock(self, session_id: str) -> Lock:
+        """Return the per-session lock, creating it once."""
+        with self._session_locks_guard:
+            lock = self._session_locks.get(session_id)
+            if lock is None:
+                lock = Lock()
+                self._session_locks[session_id] = lock
+            return lock
+
+    def _run_pipeline_serialized(self, message: Message):
+        """Run the pipeline for one utterance, serialized against its session."""
+        session = message.context.get("session") or {}
+        session_id = session.get("session_id", "default")
+        try:
+            with self._session_lock(session_id):
+                return self._run_pipeline(message)
+        except Exception:
+            # A worker thread has no caller to propagate to; a failure here
+            # must never take the pool thread down silently mid-utterance.
+            LOG.exception("concurrent intent pipeline worker failed")
+
+    def _run_pipeline(self, message: Message):
         """Main entrypoint for handling user utterances
 
         Monitor the messagebus for 'ovos.utterance.handle', typically
@@ -626,7 +691,8 @@ class IntentService:
         # match
         match = None
         with stopwatch:
-            self._deactivations[sess.session_id] = []
+            with self._deactivations_lock:
+                self._deactivations[sess.session_id] = []
             # Loop through the matching functions until a match is found.
             for pipeline, match_func in self.get_pipeline(session=sess):
                 langs = [lang]
@@ -686,8 +752,9 @@ class IntentService:
         # sync any changes made to the default session, eg by ConverseService
         if sess.session_id == "default":
             SessionManager.sync(message)
-        elif sess.session_id in self._deactivations:
-            self._deactivations.pop(sess.session_id)
+        else:
+            with self._deactivations_lock:
+                self._deactivations.pop(sess.session_id, None)
         return match, message.context, stopwatch
 
     def send_complete_intent_failure(self, message):

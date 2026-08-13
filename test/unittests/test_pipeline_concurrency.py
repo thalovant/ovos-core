@@ -180,3 +180,61 @@ def test_shutdown_drains_inflight_work():
     svc._run_pipeline = lambda m: done.append("inline")
     svc.handle_utterance(_msg("s1"))
     assert done[-1] == "inline"
+
+
+# ---------------------------------------------------------------------------
+# get_pipeline matcher cache (perf: skip the ~160us per-utterance rebuild)
+# ---------------------------------------------------------------------------
+
+def _cache_service():
+    svc = object.__new__(IntentService)
+    svc.config = {}
+    svc._init_pipeline_concurrency(svc.config)
+    plugin = MagicMock()
+    plugin.match = MagicMock()
+    svc.pipeline_plugins = {"ovos-converse-pipeline-plugin": plugin}
+    return svc
+
+
+def _session(pipeline, blacklisted=None, session_id="s1"):
+    sess = MagicMock()
+    sess.session_id = session_id
+    sess.pipeline = pipeline
+    sess.blacklisted_pipelines = blacklisted or []
+    return sess
+
+
+def test_get_pipeline_is_cached_per_pipeline_and_blacklist():
+    svc = _cache_service()
+    sess = _session(["converse"])
+    first = svc.get_pipeline(session=sess)
+    assert len(first) == 1
+    # same (pipeline, blacklist) -> the cached object, even for another session
+    assert svc.get_pipeline(session=_session(["converse"], session_id="s2")) is first
+    # different blacklist -> different entry
+    blocked = svc.get_pipeline(session=_session(
+        ["converse"], blacklisted=["converse"]))
+    assert blocked is not first
+    assert blocked == []
+
+
+def test_pipeline_cache_cleared_on_reload():
+    svc = _cache_service()
+    sess = _session(["converse"])
+    first = svc.get_pipeline(session=sess)
+    # reload swaps the plugin; the stale matcher must not be served
+    svc._pipeline_matcher_cache.clear()  # what handle_reload_pipelines does
+    new_plugin = MagicMock()
+    new_plugin.match = MagicMock()
+    svc.pipeline_plugins = {"ovos-converse-pipeline-plugin": new_plugin}
+    second = svc.get_pipeline(session=sess)
+    assert second is not first
+    assert second[0][1] is new_plugin.match
+
+
+def test_pipeline_cache_is_bounded():
+    svc = _cache_service()
+    for i in range(80):  # more unique pipelines than the 64-entry bound
+        svc.get_pipeline(session=_session(["converse"] * (i % 3 + 1),
+                                          blacklisted=[f"nope-{i}"]))
+    assert len(svc._pipeline_matcher_cache) <= 64

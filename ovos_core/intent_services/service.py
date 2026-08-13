@@ -14,6 +14,7 @@
 #
 
 import json
+import logging
 import re
 import time
 from collections import defaultdict, deque
@@ -67,6 +68,21 @@ _PIPELINE_MIGRATION_MAP = {
 }
 
 _PIPELINE_RE = re.compile(r'-(high|medium|low)$')
+
+
+def _debug_logging_enabled() -> bool:
+    """True if a ``LOG.debug`` call would actually emit.
+
+    ``ovos_utils.LOG`` resolves the calling module by walking the stack on
+    every call, *before* the level check, so even a suppressed ``LOG.debug``
+    costs ~30us. Per-utterance hot loops evaluate this once (a few ns) and
+    skip suppressed debug calls entirely. Fails open: an unrecognized level
+    just means the debug call happens as before.
+    """
+    level = LOG.level
+    if isinstance(level, str):
+        level = logging.getLevelName(level)  # "INFO" -> 20
+    return not isinstance(level, int) or level <= logging.DEBUG
 
 # OVOS-PIPELINE-1 §7.3 reserved intent_names. A Match produced by one of the
 # reserving pipeline-plugin roles below is a reserved-name dispatch: §7.1
@@ -233,6 +249,8 @@ class IntentService:
                 LOG.debug(f"Loaded pipeline plugin: '{p}'")
             except Exception as e:
                 LOG.error(f"Failed to load pipeline plugin '{p}': {e}")
+        # matcher lists resolve against pipeline_plugins, which just changed
+        self._pipeline_matcher_cache.clear()
         self.status.set_ready()
 
     def _handle_transformers(self, message):
@@ -321,6 +339,21 @@ class IntentService:
         # emitted for the skip, it is observable only as a non-invocation.
         # Unknown pipeline_ids in the blacklist are harmless no-ops.
         blacklisted = set(session.blacklisted_pipelines or [])
+
+        # The matcher list is a pure function of (pipeline, blacklist,
+        # loaded plugins); plugins only change via handle_reload_pipelines,
+        # which clears this cache. Virtually every session runs the deployment
+        # default pipeline, so under load this skips ~160us of per-utterance
+        # rebuild (migration-map lookups, regex, and LOG calls that pay a
+        # stack-walk even when suppressed). Callers only iterate the returned
+        # list, so sharing the cached object is safe. Benign race: two threads
+        # may build the same entry concurrently; last write wins, both are
+        # correct.
+        cache_key = (tuple(session.pipeline), frozenset(blacklisted))
+        cached = self._pipeline_matcher_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         requested = [p for p in session.pipeline if p not in blacklisted]
         if blacklisted:
             skipped = [p for p in session.pipeline if p in blacklisted]
@@ -335,6 +368,11 @@ class IntentService:
             LOG.warning(f"Requested some invalid pipeline components! "
                         f"filtered: {[k for k in requested if k not in final_pipeline]}")
         LOG.debug(f"Session final pipeline: {final_pipeline}")
+        # sessions carry arbitrary client-supplied pipelines; keep the cache
+        # bounded so a hostile/buggy client cannot grow it without limit
+        if len(self._pipeline_matcher_cache) >= 64:
+            self._pipeline_matcher_cache.clear()
+        self._pipeline_matcher_cache[cache_key] = matchers
         return matchers
 
     @staticmethod
@@ -631,6 +669,13 @@ class IntentService:
         self._session_queues: dict = {}
         self._session_guard = Lock()
         self._pending_count = 0
+        # Matcher-list cache for :meth:`get_pipeline`, keyed by the session's
+        # (pipeline, blacklist) pair. Rebuilding the list costs ~160us per
+        # utterance (14 migration-map lookups + regex + a suppressed LOG.debug
+        # that still walks the stack) and virtually every session uses the
+        # deployment default pipeline, so this is a near-100% hit rate.
+        # Invalidated in handle_reload_pipelines whenever plugins (re)load.
+        self._pipeline_matcher_cache: dict = {}
 
     def handle_utterance(self, message: Message):
         """Entrypoint for user utterances (bus handler for OVOS-PIPELINE §5.1).
@@ -766,6 +811,9 @@ class IntentService:
 
         # match
         match = None
+        # evaluated once per utterance: each suppressed LOG.debug still pays a
+        # stack walk (~30us), and the no-match branch below runs per stage
+        debug = _debug_logging_enabled()
         with stopwatch:
             with self._deactivations_lock:
                 self._deactivations[sess.session_id] = []
@@ -814,7 +862,8 @@ class IntentService:
                         except Exception:
                             LOG.exception(f"{match_func} returned an invalid match")
                 else:
-                    LOG.debug(f"no match from {match_func}")
+                    if debug:
+                        LOG.debug(f"no match from {match_func}")
                     continue
                 break
             else:
@@ -823,7 +872,8 @@ class IntentService:
                 message.data["lang"] = lang
                 self.send_complete_intent_failure(message)
 
-        LOG.debug(f"intent matching took: {stopwatch.time}")
+        if debug:
+            LOG.debug(f"intent matching took: {stopwatch.time}")
 
         # sync any changes made to the default session, eg by ConverseService
         #

@@ -669,6 +669,10 @@ class IntentService:
         self._session_queues: dict = {}
         self._session_guard = Lock()
         self._pending_count = 0
+        # Flipped (under ``_session_guard``) at the top of :meth:`shutdown`,
+        # before the executor drains: admissions that lose the race are shed
+        # with a no-match terminal instead of interleaving with teardown.
+        self._pipeline_accepting = True
         # Matcher-list cache for :meth:`get_pipeline`, keyed by the session's
         # (pipeline, blacklist) pair. Rebuilding the list costs ~160us per
         # utterance (14 migration-map lookups + regex + a suppressed LOG.debug
@@ -691,13 +695,16 @@ class IntentService:
         if self._pipeline_executor is None:
             return self._run_pipeline(message)
         if not self._admit(message):
-            # Bounded admission tripped: the runtime is saturated. Give the
-            # satellite an explicit no-match terminal rather than dropping the
-            # utterance silently, which would leave the client hanging until
-            # its own timeout.
-            LOG.warning("intent pipeline saturated (%d pending >= %d); "
-                        "shedding utterance",
-                        self._pending_count, self._pipeline_max_pending)
+            # Admission refused: the runtime is saturated (pending bound
+            # reached) or shutting down. Give the satellite an explicit
+            # no-match terminal rather than dropping the utterance silently,
+            # which would leave the client hanging until its own timeout.
+            if self._pipeline_accepting:
+                LOG.warning("intent pipeline saturated (%d pending >= %d); "
+                            "shedding utterance",
+                            self._pending_count, self._pipeline_max_pending)
+            else:
+                LOG.warning("intent pipeline shutting down; shedding utterance")
             try:
                 self.send_complete_intent_failure(message)
             except Exception:
@@ -707,15 +714,28 @@ class IntentService:
     def _admit(self, message: Message) -> bool:
         """Queue an utterance for its session's FIFO drainer.
 
-        Returns ``False`` (shedding the utterance) once the global pending
-        bound is reached. Otherwise appends to the session's queue and, if no
-        drainer is currently running for that session, submits exactly one.
-        The invariant held under ``_session_guard`` is: a ``session_id`` is
-        present in ``_session_queues`` iff a drainer is running for it.
+        Returns ``False`` (shedding the utterance) if shutdown has started or
+        the global pending bound is reached. Otherwise appends to the session's
+        queue and, if no drainer is currently running for that session, submits
+        exactly one. Invariants held under ``_session_guard``: a ``session_id``
+        is present in ``_session_queues`` iff a drainer is running for it, and
+        every admission happens-before ``shutdown()``'s executor drain.
+
+        The drainer is submitted *while holding the guard*: ``shutdown()``
+        flips ``_pipeline_accepting`` under this same guard before it closes
+        the executor, so an admission that saw ``accepting`` cannot interleave
+        with executor teardown -- either it wins the guard and its submit lands
+        before the drain, or it loses and is rejected here. (A lost submit
+        could otherwise strand messages that concurrent admissions appended
+        after ours: their callers were already told ``True``, so a rollback
+        that popped the whole queue would drop them without a terminal and
+        leak pending capacity.)
         """
         session = message.context.get("session") or {}
         session_id = session.get("session_id", "default")
         with self._session_guard:
+            if not self._pipeline_accepting:
+                return False
             if self._pending_count >= self._pipeline_max_pending:
                 return False
             q = self._session_queues.get(session_id)
@@ -725,16 +745,19 @@ class IntentService:
                 self._session_queues[session_id] = q
             q.append(message)
             self._pending_count += 1
-        if start_drainer:
-            try:
-                self._pipeline_executor.submit(self._drain_session, session_id)
-            except RuntimeError:
-                # Executor already shut down (teardown races a late utterance):
-                # undo the bookkeeping so the bound and map do not leak.
-                with self._session_guard:
-                    self._pending_count -= 1
+            if start_drainer:
+                try:
+                    self._pipeline_executor.submit(self._drain_session,
+                                                   session_id)
+                except RuntimeError:
+                    # Unreachable through shutdown() (the accepting flag is
+                    # flipped under this guard first); kept as a belt against
+                    # any other executor teardown. We hold the guard, so the
+                    # queue still contains exactly our message -- rollback is
+                    # exact and leaks nothing.
                     self._session_queues.pop(session_id, None)
-                return False
+                    self._pending_count -= 1
+                    return False
         return True
 
     def _drain_session(self, session_id: str):
@@ -1032,8 +1055,16 @@ class IntentService:
         # was assigned).
         executor = getattr(self, "_pipeline_executor", None)
         if executor is not None:
+            # Stop admissions under the guard BEFORE draining: _admit submits
+            # its drainer under this same guard, so once the flag flips no
+            # admission can interleave with the executor teardown -- late
+            # utterances are shed with a no-match terminal instead. The
+            # executor attribute deliberately stays set: clearing it would
+            # reroute late in-flight handlers onto the inline path, running
+            # the pipeline against plugins this method is about to tear down.
+            with self._session_guard:
+                self._pipeline_accepting = False
             executor.shutdown(wait=True)
-            self._pipeline_executor = None
 
         self.intent_dispatcher.shutdown()
         self.intent_manifest.shutdown()

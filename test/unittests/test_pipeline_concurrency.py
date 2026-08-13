@@ -156,8 +156,15 @@ def test_overload_sheds_with_no_match_terminal():
     assert svc._session_queues == {}, "session map leaked entries"
 
 
+def _shutdown_executor(svc):
+    """Mimic the executor-drain portion of IntentService.shutdown()."""
+    with svc._session_guard:
+        svc._pipeline_accepting = False
+    svc._pipeline_executor.shutdown(wait=True)
+
+
 def test_shutdown_drains_inflight_work():
-    """shutdown() must wait for queued work, then run without the executor."""
+    """shutdown() must wait for queued work; late utterances get a terminal."""
     svc = _service(2)
     done = []
     release = threading.Event()
@@ -172,14 +179,61 @@ def test_shutdown_drains_inflight_work():
         m.data["seq"] = i
         svc.handle_utterance(m)
     release.set()
-    # mimic the executor-drain portion of IntentService.shutdown()
-    svc._pipeline_executor.shutdown(wait=True)
-    svc._pipeline_executor = None
+    _shutdown_executor(svc)
     assert done == [0, 1, 2], "shutdown did not drain queued work in order"
-    # post-shutdown the inline path still works (executor gone -> inline)
-    svc._run_pipeline = lambda m: done.append("inline")
+    # a late utterance after shutdown is shed with the no-match terminal --
+    # never run against plugins that are being torn down, never queued
     svc.handle_utterance(_msg("s1"))
-    assert done[-1] == "inline"
+    svc.send_complete_intent_failure.assert_called_once()
+    assert done == [0, 1, 2]
+    assert svc._pending_count == 0
+    assert svc._session_queues == {}
+
+
+def test_admission_shutdown_interleaving_leaks_nothing():
+    """Admissions racing shutdown either fully land or are fully shed.
+
+    Drives the race from many threads while shutdown flips the accepting
+    flag mid-storm: every utterance must either run or produce a no-match
+    terminal -- none silently dropped -- and the pending counter and session
+    map must end clean (no leaked capacity).
+    """
+    svc = _service(4)
+    ran = []
+    ran_lock = threading.Lock()
+
+    def run(m):
+        with ran_lock:
+            ran.append(m.data["seq"])
+    svc._run_pipeline = run
+
+    N = 200
+    barrier = threading.Barrier(9)
+
+    def submitter(base):
+        barrier.wait(timeout=5)
+        for i in range(N // 8):
+            m = _msg(f"sess-{(base + i) % 5}")
+            m.data["seq"] = base + i
+            svc.handle_utterance(m)
+
+    def stopper():
+        barrier.wait(timeout=5)
+        _shutdown_executor(svc)
+
+    threads = [threading.Thread(target=submitter, args=(k * (N // 8),))
+               for k in range(8)] + [threading.Thread(target=stopper)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    shed = svc.send_complete_intent_failure.call_count
+    assert len(ran) + shed == N, (
+        f"{N - len(ran) - shed} utterances vanished without running "
+        f"or receiving a terminal (ran={len(ran)}, shed={shed})")
+    assert svc._pending_count == 0, "pending capacity leaked"
+    assert svc._session_queues == {}, "session map leaked entries"
 
 
 # ---------------------------------------------------------------------------

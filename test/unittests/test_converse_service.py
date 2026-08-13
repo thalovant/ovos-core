@@ -616,50 +616,66 @@ class TestMatch(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestGetResponseHandlers(unittest.TestCase):
-    """Tests for the get_response enable/disable bus handlers."""
+    """Tests for the get_response enable/disable bus handlers.
+
+    These tests exercise the REAL SessionManager.sessions registry (no
+    mocking of SessionManager.get), mirroring
+    test_intent_service_extended.py's registry-first test shape for #857.
+    setUp/tearDown save+clear the real registry so a session id reused
+    across tests in this module (e.g. "s") can never leak state between
+    them and can never accidentally satisfy the registry-first lookup
+    with a stale entry left by an earlier test.
+    """
+
+    def setUp(self):
+        self._saved_sessions = dict(SessionManager.sessions)
+        SessionManager.sessions.clear()
+
+    def tearDown(self):
+        SessionManager.sessions.clear()
+        SessionManager.sessions.update(self._saved_sessions)
 
     def test_handle_get_response_enable_sets_response_state(self):
         """enable handler puts the skill into RESPONSE utterance state."""
         sess = Session("s")
         sess.activate_skill("skill_a")
+        SessionManager.sessions[sess.session_id] = sess
         msg = Message("skill.converse.get_response.enable",
                       data={"skill_id": "skill_a"},
                       context={"session": sess.serialize()})
 
-        with patch("ovos_core.intent_services.converse_service.SessionManager.get",
-                   return_value=sess), \
-             patch("ovos_core.intent_services.converse_service.SessionManager.sync"):
+        with patch("ovos_core.intent_services.converse_service.SessionManager.sync"):
             ConverseService.handle_get_response_enable(msg)
 
-        self.assertEqual(sess.utterance_states.get("skill_a"), UtteranceState.RESPONSE)
+        live = SessionManager.sessions[sess.session_id]
+        self.assertEqual(live.utterance_states.get("skill_a"), UtteranceState.RESPONSE)
 
     def test_handle_get_response_disable_restores_intent_state(self):
         """disable handler removes the skill from RESPONSE state."""
         sess = Session("s")
         sess.activate_skill("skill_a")
         sess.enable_response_mode("skill_a")
+        SessionManager.sessions[sess.session_id] = sess
         msg = Message("skill.converse.get_response.disable",
                       data={"skill_id": "skill_a"},
                       context={"session": sess.serialize()})
 
-        with patch("ovos_core.intent_services.converse_service.SessionManager.get",
-                   return_value=sess), \
-             patch("ovos_core.intent_services.converse_service.SessionManager.sync"):
+        with patch("ovos_core.intent_services.converse_service.SessionManager.sync"):
             ConverseService.handle_get_response_disable(msg)
 
-        self.assertNotEqual(sess.utterance_states.get("skill_a"), UtteranceState.RESPONSE)
+        live = SessionManager.sessions[sess.session_id]
+        self.assertNotEqual(live.utterance_states.get("skill_a"), UtteranceState.RESPONSE)
 
     def test_handle_get_response_enable_syncs_default_session(self):
         """enable handler calls SessionManager.sync for the default session."""
         sess = Session("default")
         sess.activate_skill("skill_a")
+        SessionManager.sessions[sess.session_id] = sess
         msg = Message("skill.converse.get_response.enable",
                       data={"skill_id": "skill_a"},
                       context={"session": sess.serialize()})
 
-        with patch("ovos_core.intent_services.converse_service.SessionManager.get",
-                   return_value=sess), \
-             patch("ovos_core.intent_services.converse_service.SessionManager.sync") as mock_sync:
+        with patch("ovos_core.intent_services.converse_service.SessionManager.sync") as mock_sync:
             ConverseService.handle_get_response_enable(msg)
 
         mock_sync.assert_called_once()
@@ -669,16 +685,71 @@ class TestGetResponseHandlers(unittest.TestCase):
         sess = Session("default")
         sess.activate_skill("skill_a")
         sess.enable_response_mode("skill_a")
+        SessionManager.sessions[sess.session_id] = sess
         msg = Message("skill.converse.get_response.disable",
                       data={"skill_id": "skill_a"},
                       context={"session": sess.serialize()})
 
-        with patch("ovos_core.intent_services.converse_service.SessionManager.get",
-                   return_value=sess), \
-             patch("ovos_core.intent_services.converse_service.SessionManager.sync") as mock_sync:
+        with patch("ovos_core.intent_services.converse_service.SessionManager.sync") as mock_sync:
             ConverseService.handle_get_response_disable(msg)
 
         mock_sync.assert_called_once()
+
+    def test_get_response_enable_survives_stale_named_session_snapshot(self):
+        """Wave-3 regression (converse write-path counterpart to #857):
+        a NAMED session's get_response state written by
+        handle_get_response_enable must land on the LIVE registry entry,
+        not a copy folded from a stale client message snapshot. Before the
+        registry-first fix, `SessionManager.get(message)` folds the
+        message's stale snapshot onto the registry entry first
+        (full-replace for named sessions via `update_from`), then the
+        handler's `enable_response_mode` write lands on that folded copy -
+        the write is visible on the return value but is never actually
+        durable proof of a *registry* write when `.get` is mocked, which is
+        exactly how the pre-fix bug hid in the two tests above. Here we
+        register a live entry, drive the handler with an intentionally
+        STALE message snapshot (unaware of the live entry's other state),
+        and assert the live registry entry itself picked up the write."""
+        sess = Session("named-converse-1")
+        sess.activate_skill("skill_a")
+        sess.activate_skill("skill_b")  # pre-existing state the stale snapshot doesn't know about
+        SessionManager.sessions[sess.session_id] = sess
+
+        stale = Session(sess.session_id)  # unaware of skill_b's activation
+        msg = Message("skill.converse.get_response.enable",
+                      data={"skill_id": "skill_a"},
+                      context={"session": stale.serialize()})
+
+        with patch("ovos_core.intent_services.converse_service.SessionManager.sync"):
+            ConverseService.handle_get_response_enable(msg)
+
+        live = SessionManager.sessions[sess.session_id]
+        self.assertEqual(live.utterance_states.get("skill_a"), UtteranceState.RESPONSE)
+        # the registry entry's pre-existing state must not have been wiped
+        # by the stale snapshot fold
+        self.assertTrue(live.is_active("skill_b"))
+
+    def test_activate_skill_survives_stale_named_session_snapshot(self):
+        """Write-path counterpart for `activate_skill`/`deactivate_skill`:
+        activating a skill for a NAMED session must mutate the LIVE
+        registry entry, so state written on it since the client's last
+        message (here, skill_b's prior activation) survives."""
+        bus = FakeBus()
+        svc = ConverseService(bus=bus, config={})
+        sess = Session("named-converse-2")
+        sess.activate_skill("skill_b")
+        SessionManager.sessions[sess.session_id] = sess
+
+        stale = Session(sess.session_id)  # unaware of skill_b's activation
+        msg = Message("intent.service.skills.activate",
+                      data={"skill_id": "skill_a"},
+                      context={"session": stale.serialize()})
+
+        svc.activate_skill("skill_a", "skill_a", msg)
+
+        live = SessionManager.sessions[sess.session_id]
+        self.assertTrue(live.is_active("skill_a"))
+        self.assertTrue(live.is_active("skill_b"))
 
 
 # ---------------------------------------------------------------------------

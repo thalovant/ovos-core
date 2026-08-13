@@ -27,6 +27,44 @@ CONVERSE_HANDLER_TIMEOUT = 5 * 60
 class ConverseService(PipelinePlugin):
     """Intent Service handling conversational skills."""
 
+    @staticmethod
+    def _registry_session_for_write(message: Optional[Message]) -> "Session":
+        """Resolve the session object to mutate for a converse write path.
+
+        Wave-3 CONFIRMED: ``SessionManager.get(message)`` always folds the
+        incoming message's session snapshot onto the live registry entry
+        (``SessionManager._store`` / ``.sessions``), and for NAMED sessions
+        that fold is full-replace (``update_from``). Calling it from a
+        write path here (activate/deactivate skill, converse timeout
+        filtering, get_response enable/disable) means the fold first wipes
+        the registry entry's *current* state with the message's stale
+        snapshot, and the handler's write then lands on that stale copy -
+        state written to the registry session since the client's last
+        message is lost the moment this handler runs, because the fold
+        discarded it first. This is not named-session-only: ``update_from``
+        round-trips through full serialize/deserialize for every session
+        id, including ``"default"``.
+
+        This mirrors ``IntentService._registry_session_for_context_write``
+        (#857, ``ovos_core/intent_services/service.py``) exactly, but is a
+        deliberately separate copy: the intent-context handlers and these
+        converse write paths are different call sites landing in different
+        PRs. Do not delete this helper assuming #857 covers it - when both
+        PRs are merged, consider consolidating the two into one shared
+        helper, but until then each pairs with its own call sites.
+
+        Fix: resolve session_id off the message and, if the registry
+        already holds a live entry for it, mutate that object directly -
+        no fold. Fall back to ``SessionManager.get(message)`` (today's
+        behavior) only when no registry entry exists yet, e.g.
+        out-of-registry/test callers or a message with no session context.
+        """
+        session_data = message.context.get("session") if message and message.context else None
+        session_id = session_data.get("session_id") if isinstance(session_data, dict) else None
+        if session_id and session_id in SessionManager.sessions:
+            return SessionManager.sessions[session_id]
+        return SessionManager.get(message)
+
     def __init__(self, bus: Optional[Union[MessageBusClient, FakeBus]] = None,
                  config: Optional[Dict] = None) -> None:
         config = config or Configuration().get("skills", {}).get("converse", {})
@@ -129,7 +167,7 @@ class ConverseService(PipelinePlugin):
         source_skill = source_skill or skill_id
         if self._deactivate_allowed(skill_id, source_skill):
             message = message or Message("")
-            session = SessionManager.get(message)
+            session = self._registry_session_for_write(message)
             if session.is_active(skill_id):
                 # update converse session
                 session.deactivate_skill(skill_id)
@@ -159,7 +197,7 @@ class ConverseService(PipelinePlugin):
         if self._activate_allowed(skill_id, source_skill):
             message = message or Message("")
             # update converse session
-            session = SessionManager.get(message)
+            session = self._registry_session_for_write(message)
             session.activate_skill(skill_id)
 
             # keep message.context
@@ -323,7 +361,7 @@ class ConverseService(PipelinePlugin):
         """ filter active skill list based on timestamps """
         timeouts = self.config.get("skill_timeouts") or {}
         def_timeout = self.config.get("timeout", 300)
-        session = SessionManager.get(message)
+        session = self._registry_session_for_write(message)
         session.active_skills = [
             skill for skill in session.active_skills
             if time.time() - skill[1] <= timeouts.get(skill[0], def_timeout)]
@@ -400,7 +438,7 @@ class ConverseService(PipelinePlugin):
     @staticmethod
     def handle_get_response_enable(message: Message):
         skill_id = message.data["skill_id"]
-        session = SessionManager.get(message)
+        session = ConverseService._registry_session_for_write(message)
         session.enable_response_mode(skill_id)
         if session.session_id == "default":
             SessionManager.sync(message)
@@ -408,7 +446,7 @@ class ConverseService(PipelinePlugin):
     @staticmethod
     def handle_get_response_disable(message: Message):
         skill_id = message.data["skill_id"]
-        session = SessionManager.get(message)
+        session = ConverseService._registry_session_for_write(message)
         session.disable_response_mode(skill_id)
         if session.session_id == "default":
             SessionManager.sync(message)

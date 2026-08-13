@@ -38,6 +38,7 @@ def _make_service(config=None) -> IntentService:
     svc.config = config or {}
     svc.pipeline_plugins = {}
     svc._deactivations = defaultdict(list)
+    svc._init_pipeline_concurrency(svc.config)
     # PIPELINE-1 §7/§8 dispatcher; timer disabled so unit tests stay deterministic
     svc.intent_dispatcher = IntentDispatcher(bus, timeout=0)
 

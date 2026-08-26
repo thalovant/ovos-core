@@ -14,9 +14,10 @@
 #
 
 import json
+import logging
 import re
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Optional, Tuple, Callable, List
 
 import requests
@@ -29,6 +30,9 @@ from ovos_spec_tools import closest_lang, standardize_lang, SpecMessage
 from ovos_utils.log import LOG
 from ovos_utils.metrics import Stopwatch
 from ovos_utils.process_utils import ProcessStatus, StatusCallbackMap
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+
 from ovos_utils.thread_utils import create_daemon
 
 from ovos_core.transformers import MetadataTransformersService, UtteranceTransformersService, IntentTransformersService
@@ -64,6 +68,21 @@ _PIPELINE_MIGRATION_MAP = {
 }
 
 _PIPELINE_RE = re.compile(r'-(high|medium|low)$')
+
+
+def _debug_logging_enabled() -> bool:
+    """True if a ``LOG.debug`` call would actually emit.
+
+    ``ovos_utils.LOG`` resolves the calling module by walking the stack on
+    every call, *before* the level check, so even a suppressed ``LOG.debug``
+    costs ~30us. Per-utterance hot loops evaluate this once (a few ns) and
+    skip suppressed debug calls entirely. Fails open: an unrecognized level
+    just means the debug call happens as before.
+    """
+    level = LOG.level
+    if isinstance(level, str):
+        level = logging.getLevelName(level)  # "INFO" -> 20
+    return not isinstance(level, int) or level <= logging.DEBUG
 
 # OVOS-PIPELINE-1 §7.3 reserved intent_names. A Match produced by one of the
 # reserving pipeline-plugin roles below is a reserved-name dispatch: §7.1
@@ -175,6 +194,18 @@ class IntentService:
         # internal, track skills that call self.deactivate to avoid reactivating them again
         self._deactivations: defaultdict = defaultdict(list)
         self.bus.on('intent.service.skills.deactivate', self._handle_deactivate)
+
+        # PERF: optional concurrent pipeline. A synchronous OVOS runtime
+        # processes utterances one at a time on the bus handler thread, so a
+        # fleet of satellites sharing a runtime queues behind each other -- the
+        # dominant latency under load (measured: 25 clients/runtime gives ~19s
+        # p95 vs ~4s at 12.5). ``pipeline_workers`` > 1 runs the pipeline on a
+        # bounded pool instead, serialized per session (same session stays
+        # ordered, different sessions run in parallel). Defaults to 1: the
+        # inline path below is then byte-identical to the original behaviour.
+        # Enable only after auditing the loaded pipeline plugins for
+        # thread-safety and validating on a single-runtime canary.
+        self._init_pipeline_concurrency(self.config)
         self.bus.on('intent.service.pipelines.reload', self.handle_reload_pipelines)
 
         self.status.set_alive()
@@ -218,6 +249,8 @@ class IntentService:
                 LOG.debug(f"Loaded pipeline plugin: '{p}'")
             except Exception as e:
                 LOG.error(f"Failed to load pipeline plugin '{p}': {e}")
+        # matcher lists resolve against pipeline_plugins, which just changed
+        self._pipeline_matcher_cache.clear()
         self.status.set_ready()
 
     def _handle_transformers(self, message):
@@ -306,6 +339,21 @@ class IntentService:
         # emitted for the skip, it is observable only as a non-invocation.
         # Unknown pipeline_ids in the blacklist are harmless no-ops.
         blacklisted = set(session.blacklisted_pipelines or [])
+
+        # The matcher list is a pure function of (pipeline, blacklist,
+        # loaded plugins); plugins only change via handle_reload_pipelines,
+        # which clears this cache. Virtually every session runs the deployment
+        # default pipeline, so under load this skips ~160us of per-utterance
+        # rebuild (migration-map lookups, regex, and LOG calls that pay a
+        # stack-walk even when suppressed). Callers only iterate the returned
+        # list, so sharing the cached object is safe. Benign race: two threads
+        # may build the same entry concurrently; last write wins, both are
+        # correct.
+        cache_key = (tuple(session.pipeline), frozenset(blacklisted))
+        cached = self._pipeline_matcher_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         requested = [p for p in session.pipeline if p not in blacklisted]
         if blacklisted:
             skipped = [p for p in session.pipeline if p in blacklisted]
@@ -320,6 +368,11 @@ class IntentService:
             LOG.warning(f"Requested some invalid pipeline components! "
                         f"filtered: {[k for k in requested if k not in final_pipeline]}")
         LOG.debug(f"Session final pipeline: {final_pipeline}")
+        # sessions carry arbitrary client-supplied pipelines; keep the cache
+        # bounded so a hostile/buggy client cannot grow it without limit
+        if len(self._pipeline_matcher_cache) >= 64:
+            self._pipeline_matcher_cache.clear()
+        self._pipeline_matcher_cache[cache_key] = matchers
         return matchers
 
     @staticmethod
@@ -353,7 +406,10 @@ class IntentService:
         """
         sess = SessionManager.get(message)
         skill_id = message.data.get("skill_id")
-        self._deactivations[sess.session_id].append(skill_id)
+        # append under the guard: a concurrent pipeline for a different session
+        # may be resizing the dict at the same moment.
+        with self._deactivations_lock:
+            self._deactivations[sess.session_id].append(skill_id)
 
     def _emit_utterance_handled(self, dispatch_msg: Message):
         """OVOS-PIPELINE-1 §9.5 — emit the universal ``ovos.utterance.handled``
@@ -577,7 +633,160 @@ class IntentService:
         self.bus.emit(message.reply(SpecMessage.UTTERANCE_CANCELLED, cancel_data))
         self.bus.emit(message.reply(SpecMessage.UTTERANCE_HANDLED))
 
+    def _init_pipeline_concurrency(self, config: dict):
+        """Initialize the optional concurrent-pipeline state.
+
+        Called from ``__init__`` (and by tests that construct the service via
+        ``__new__``, so the concurrency state has exactly one definition).
+
+        ``pipeline_workers`` (default 1) sizes the pool; 1 keeps the historical
+        inline path with no executor at all. ``pipeline_max_pending`` (default
+        32 per worker) bounds utterances in flight + queued: ``ThreadPoolExecutor``
+        caps *running* workers but its submit queue is unbounded, so sustained
+        overload would retain ``Message`` objects until the process is
+        OOM-killed. Past the bound we shed load with an explicit no-match
+        terminal (see :meth:`handle_utterance`) instead of buffering without
+        limit.
+
+        Same-session ordering uses a per-session FIFO queue drained by a single
+        worker (see :meth:`_drain_session`): a bare Lock does NOT preserve
+        acquisition order, so lock-only serialization could reorder
+        same-session utterances. Distinct sessions drain on separate pool
+        threads and therefore run in parallel. ``_session_guard`` covers the
+        queue map and ``_pending_count`` together; ``_deactivations_lock``
+        guards structural mutation of ``_deactivations`` when two sessions are
+        in flight at once.
+        """
+        self._deactivations_lock = Lock()
+        _workers = max(1, int(config.get("pipeline_workers", 1)))
+        self._pipeline_executor = (
+            ThreadPoolExecutor(max_workers=_workers,
+                               thread_name_prefix="intent-pipeline")
+            if _workers > 1 else None
+        )
+        self._pipeline_max_pending = max(
+            _workers, int(config.get("pipeline_max_pending", _workers * 32)))
+        self._session_queues: dict = {}
+        self._session_guard = Lock()
+        self._pending_count = 0
+        # Flipped (under ``_session_guard``) at the top of :meth:`shutdown`,
+        # before the executor drains: admissions that lose the race are shed
+        # with a no-match terminal instead of interleaving with teardown.
+        self._pipeline_accepting = True
+        # Matcher-list cache for :meth:`get_pipeline`, keyed by the session's
+        # (pipeline, blacklist) pair. Rebuilding the list costs ~160us per
+        # utterance (14 migration-map lookups + regex + a suppressed LOG.debug
+        # that still walks the stack) and virtually every session uses the
+        # deployment default pipeline, so this is a near-100% hit rate.
+        # Invalidated in handle_reload_pipelines whenever plugins (re)load.
+        self._pipeline_matcher_cache: dict = {}
+
     def handle_utterance(self, message: Message):
+        """Entrypoint for user utterances (bus handler for OVOS-PIPELINE §5.1).
+
+        Dispatches to :meth:`_run_pipeline`. With ``pipeline_workers`` == 1
+        (default) this is a direct inline call -- identical to the historical
+        behaviour. With more workers the pipeline runs on a bounded pool so
+        concurrent satellites do not serialize on the single bus thread; work
+        is queued per session (FIFO) so same-session ordering and the
+        per-session ``_deactivations`` state are preserved, while distinct
+        sessions run in parallel.
+        """
+        if self._pipeline_executor is None:
+            return self._run_pipeline(message)
+        if not self._admit(message):
+            # Admission refused: the runtime is saturated (pending bound
+            # reached) or shutting down. Give the satellite an explicit
+            # no-match terminal rather than dropping the utterance silently,
+            # which would leave the client hanging until its own timeout.
+            if self._pipeline_accepting:
+                LOG.warning("intent pipeline saturated (%d pending >= %d); "
+                            "shedding utterance",
+                            self._pending_count, self._pipeline_max_pending)
+            else:
+                LOG.warning("intent pipeline shutting down; shedding utterance")
+            try:
+                self.send_complete_intent_failure(message)
+            except Exception:
+                LOG.exception("failed to emit overload no-match terminal")
+        return None
+
+    def _admit(self, message: Message) -> bool:
+        """Queue an utterance for its session's FIFO drainer.
+
+        Returns ``False`` (shedding the utterance) if shutdown has started or
+        the global pending bound is reached. Otherwise appends to the session's
+        queue and, if no drainer is currently running for that session, submits
+        exactly one. Invariants held under ``_session_guard``: a ``session_id``
+        is present in ``_session_queues`` iff a drainer is running for it, and
+        every admission happens-before ``shutdown()``'s executor drain.
+
+        The drainer is submitted *while holding the guard*: ``shutdown()``
+        flips ``_pipeline_accepting`` under this same guard before it closes
+        the executor, so an admission that saw ``accepting`` cannot interleave
+        with executor teardown -- either it wins the guard and its submit lands
+        before the drain, or it loses and is rejected here. (A lost submit
+        could otherwise strand messages that concurrent admissions appended
+        after ours: their callers were already told ``True``, so a rollback
+        that popped the whole queue would drop them without a terminal and
+        leak pending capacity.)
+        """
+        session = message.context.get("session") or {}
+        session_id = session.get("session_id", "default")
+        with self._session_guard:
+            if not self._pipeline_accepting:
+                return False
+            if self._pending_count >= self._pipeline_max_pending:
+                return False
+            q = self._session_queues.get(session_id)
+            start_drainer = q is None
+            if start_drainer:
+                q = deque()
+                self._session_queues[session_id] = q
+            q.append(message)
+            self._pending_count += 1
+            if start_drainer:
+                try:
+                    self._pipeline_executor.submit(self._drain_session,
+                                                   session_id)
+                except RuntimeError:
+                    # Unreachable through shutdown() (the accepting flag is
+                    # flipped under this guard first); kept as a belt against
+                    # any other executor teardown. We hold the guard, so the
+                    # queue still contains exactly our message -- rollback is
+                    # exact and leaks nothing.
+                    self._session_queues.pop(session_id, None)
+                    self._pending_count -= 1
+                    return False
+        return True
+
+    def _drain_session(self, session_id: str):
+        """Drain one session's queue in FIFO order on a single pool thread.
+
+        One drainer per session is what guarantees same-session utterances run
+        in submission order (a bare Lock would not). The drainer exits when its
+        queue empties -- removing the ``session_id`` so the next utterance
+        starts a fresh drainer and the map does not leak session ids -- and is
+        re-submitted by :meth:`_admit`.
+        """
+        while True:
+            with self._session_guard:
+                q = self._session_queues.get(session_id)
+                if not q:
+                    self._session_queues.pop(session_id, None)
+                    return
+                message = q.popleft()
+            try:
+                self._run_pipeline(message)
+            except Exception:
+                # One utterance failing must not strand the rest of this
+                # session's queued utterances, nor take the pool thread down.
+                LOG.exception("concurrent intent pipeline worker failed")
+            finally:
+                with self._session_guard:
+                    self._pending_count -= 1
+
+    def _run_pipeline(self, message: Message):
         """Main entrypoint for handling user utterances
 
         Monitor the messagebus for 'ovos.utterance.handle', typically
@@ -625,8 +834,12 @@ class IntentService:
 
         # match
         match = None
+        # evaluated once per utterance: each suppressed LOG.debug still pays a
+        # stack walk (~30us), and the no-match branch below runs per stage
+        debug = _debug_logging_enabled()
         with stopwatch:
-            self._deactivations[sess.session_id] = []
+            with self._deactivations_lock:
+                self._deactivations[sess.session_id] = []
             # Loop through the matching functions until a match is found.
             for pipeline, match_func in self.get_pipeline(session=sess):
                 langs = [lang]
@@ -672,7 +885,8 @@ class IntentService:
                         except Exception:
                             LOG.exception(f"{match_func} returned an invalid match")
                 else:
-                    LOG.debug(f"no match from {match_func}")
+                    if debug:
+                        LOG.debug(f"no match from {match_func}")
                     continue
                 break
             else:
@@ -681,13 +895,25 @@ class IntentService:
                 message.data["lang"] = lang
                 self.send_complete_intent_failure(message)
 
-        LOG.debug(f"intent matching took: {stopwatch.time}")
+        if debug:
+            LOG.debug(f"intent matching took: {stopwatch.time}")
 
         # sync any changes made to the default session, eg by ConverseService
+        #
+        # Concurrency note (pipeline_workers > 1): default-session reads/writes
+        # in this pipeline (reset/update/sync here and in _validate_session) all
+        # run on the *same* per-session drainer -- "default" is one session id,
+        # so its utterances are serialized FIFO and never race each other.
+        # What is NOT covered here is other bus handlers outside the pipeline
+        # (e.g. ConverseService) mutating the process-global default session
+        # concurrently; closing that requires locking inside SessionManager
+        # (ovos-bus-client), and is a named item on the pre-enablement audit in
+        # the PR description -- not something a local lock in this class can fix.
         if sess.session_id == "default":
             SessionManager.sync(message)
-        elif sess.session_id in self._deactivations:
-            self._deactivations.pop(sess.session_id)
+        else:
+            with self._deactivations_lock:
+                self._deactivations.pop(sess.session_id, None)
         return match, message.context, stopwatch
 
     def send_complete_intent_failure(self, message):
@@ -818,6 +1044,28 @@ class IntentService:
                                     {"intent": None, "utterance": utterance}))
 
     def shutdown(self) -> None:
+        # Stop accepting new utterances first, then drain any in-flight or
+        # queued pipeline work, so the concurrent drainers finish before the
+        # plugins they call into are torn down. ``wait=True`` blocks until the
+        # pool is idle; removing the bus handler up front means no new work can
+        # be submitted while we drain.
+        self.bus.remove(SpecMessage.UTTERANCE, self.handle_utterance)
+        # getattr: stay robust if shutdown() is reached on a partially
+        # constructed instance (__init__ failed before the executor attribute
+        # was assigned).
+        executor = getattr(self, "_pipeline_executor", None)
+        if executor is not None:
+            # Stop admissions under the guard BEFORE draining: _admit submits
+            # its drainer under this same guard, so once the flag flips no
+            # admission can interleave with the executor teardown -- late
+            # utterances are shed with a no-match terminal instead. The
+            # executor attribute deliberately stays set: clearing it would
+            # reroute late in-flight handlers onto the inline path, running
+            # the pipeline against plugins this method is about to tear down.
+            with self._session_guard:
+                self._pipeline_accepting = False
+            executor.shutdown(wait=True)
+
         self.intent_dispatcher.shutdown()
         self.intent_manifest.shutdown()
         self.utterance_plugins.shutdown()
@@ -836,7 +1084,8 @@ class IntentService:
                     LOG.warning(f"Failed to shutdown pipeline {pipeline}: {e}")
                     continue
 
-        self.bus.remove(SpecMessage.UTTERANCE, self.handle_utterance)
+        # (SpecMessage.UTTERANCE handler already removed at the top of shutdown,
+        # before draining the pipeline executor.)
         self.bus.remove('add_context', self.handle_add_context)
         self.bus.remove('remove_context', self.handle_remove_context)
         self.bus.remove('clear_context', self.handle_clear_context)

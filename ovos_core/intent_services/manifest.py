@@ -13,7 +13,9 @@
 # limitations under the License.
 
 from ovos_bus_client.message import Message
-from ovos_spec_tools import standardize_lang
+from typing import Iterable, Optional
+
+from ovos_spec_tools import closest_lang, standardize_lang
 from ovos_utils.log import LOG
 
 
@@ -31,6 +33,11 @@ class IntentManifest:
     that wants every intent's sentences needs one round trip per language
     instead of one describe per intent. Without the flag the reply is the
     plain §10.1 row.
+
+    A ``lang`` asked of any query is resolved per intent the way utterance
+    matching resolves it (see :meth:`_resolve_lang`): an intent registered
+    only as ``en-US`` is listed and described for an ``en-CA`` client, and
+    its rows keep their registered ``lang`` so the client sees what it got.
     """
 
     def __init__(self, bus):
@@ -66,6 +73,42 @@ class IntentManifest:
               lang: str, method: str) -> tuple:
         return session_id, skill_id, intent_name, standardize_lang(lang), method
 
+    @staticmethod
+    def _resolve_lang(lang: str, registered: Iterable[str]) -> Optional[str]:
+        """The registered language that answers a query in *lang*.
+
+        The same OVOS-INTENT-2 §2.2 fallback utterance matching applies
+        (``ovos_spec_tools.closest_lang``, which the adapt, padatious and
+        padacioso engines and ovos-m2v-pipeline's per-label resolution all
+        call): an exact match wins, otherwise the nearest registered region,
+        so ``en-CA`` reaches ``en-US`` and ``fr-CA`` reaches ``fr-FR``.
+
+        Candidates are narrowed to *lang*'s primary subtag first. The
+        language distance alone would admit a neighbouring language
+        (``bs`` against ``hr`` is within the threshold); a listing never
+        answers in a language the client did not ask for.
+
+        Returns ``None`` when nothing registered is close enough.
+        """
+        lang = standardize_lang(lang)
+        primary = lang.split("-")[0].lower()
+        candidates = sorted({r for r in registered
+                             if r.split("-")[0].lower() == primary})
+        return closest_lang(lang, candidates)
+
+    @classmethod
+    def _answering_langs(cls, entries: list, lang: str) -> dict:
+        """Map each ``(skill_id, intent_name)`` in *entries* to the
+        registered language answering *lang*, resolved per intent the way
+        ovos-m2v-pipeline resolves each label: an intent registered in a
+        single dialect keeps it whatever dialects other skills use."""
+        by_intent: dict = {}
+        for entry in entries:
+            by_intent.setdefault((entry["skill_id"], entry["intent_name"]),
+                                 set()).add(entry["lang"])
+        return {intent: cls._resolve_lang(lang, langs)
+                for intent, langs in by_intent.items()}
+
     def _effective_pool(self, session_id: str) -> list:
         """Return entries for *session_id* merged with 'default' (§11.2)."""
         seen = {}
@@ -89,11 +132,12 @@ class IntentManifest:
         Returns ``[]`` when the intent is not in the manifest (e.g. registered via
         a legacy in-process path), leaving engine-side enforcement authoritative.
         """
-        lang = standardize_lang(lang)
+        entries = [e for e in self._effective_pool(session_id)
+                   if e["skill_id"] == skill_id and e["intent_name"] == intent_name]
+        answering = self._resolve_lang(lang, {e["lang"] for e in entries})
         slots: list = []
-        for entry in self._effective_pool(session_id):
-            if (entry["skill_id"] != skill_id or entry["intent_name"] != intent_name
-                    or entry["lang"] != lang):
+        for entry in entries:
+            if entry["lang"] != answering:
                 continue
             for slot in (entry.get("definition") or {}).get("required_slots") or []:
                 if slot not in slots:
@@ -173,15 +217,15 @@ class IntentManifest:
         # ``ovos.intent.describe`` returns as ``definition``) so a client
         # gets the sentences for a whole language in this one reply.
         include_definitions = bool(message.data.get("include_definitions", False))
-        if f_lang:
-            f_lang = standardize_lang(f_lang)
 
         pool = self._effective_pool(f_session) if f_session else list(self._index.values())
+        if f_skill:
+            pool = [e for e in pool if e["skill_id"] == f_skill]
+        answering = self._answering_langs(pool, f_lang) if f_lang else None
         results = []
         for entry in pool:
-            if f_skill and entry["skill_id"] != f_skill:
-                continue
-            if f_lang and entry["lang"] != f_lang:
+            if answering is not None and \
+                    entry["lang"] != answering[(entry["skill_id"], entry["intent_name"])]:
                 continue
             row = {k: entry[k] for k in
                    ("skill_id", "intent_name", "lang", "method", "enabled", "session_id")}
@@ -202,11 +246,12 @@ class IntentManifest:
                                         {"ok": False,
                                          "error": "skill_id, intent_name and lang are required"}))
             return
-        lang = standardize_lang(lang)
-        pool = self._effective_pool(session_id)
+        entries = [e for e in self._effective_pool(session_id)
+                   if e["skill_id"] == skill_id and e["intent_name"] == intent_name]
+        answering = self._resolve_lang(lang, {e["lang"] for e in entries})
         definitions = []
-        for entry in pool:
-            if entry["skill_id"] != skill_id or entry["intent_name"] != intent_name or entry["lang"] != lang:
+        for entry in entries:
+            if entry["lang"] != answering:
                 continue
             if method_filter and entry["method"] != method_filter:
                 continue

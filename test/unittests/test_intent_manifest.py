@@ -305,3 +305,123 @@ class TestIntentDescribeQuery(unittest.TestCase):
     def test_describe_missing_fields_returns_error(self):
         resp = self._query(skill_id="skill.a")
         self.assertFalse(resp["ok"])
+
+
+class TestClosestLanguage(unittest.TestCase):
+    """A ``lang`` asked of the manifest resolves the way utterance matching
+    does (OVOS-INTENT-2 §2.2 via ``closest_lang``): exact first, else the
+    nearest registered region of the same language. A Canadian client must
+    see the intents it can already trigger."""
+
+    def setUp(self):
+        self.m = _manifest()
+        self.m._on_register(_reg("skill.weather", "current.weather", lang="en-US",
+                                 method="template", samples=["what is the weather"]))
+        self.m._on_register(_reg("skill.weather", "current.weather", lang="fr-FR",
+                                 method="template", samples=["quel temps fait-il"]))
+        self.m._on_register(_reg("skill.time", "what.time", lang="en-US",
+                                 method="keyword", required_slots=["location"]))
+
+    def _list(self, **kwargs):
+        replies = []
+        self.m.bus.on("ovos.intent.list.response", lambda msg: replies.append(msg))
+        self.m._on_list(Message("ovos.intent.list", data=kwargs))
+        return replies[-1].data
+
+    def _describe(self, **kwargs):
+        replies = []
+        self.m.bus.on("ovos.intent.describe.response", lambda msg: replies.append(msg))
+        self.m._on_describe(Message("ovos.intent.describe", data=kwargs))
+        return replies[-1].data
+
+    @staticmethod
+    def _pairs(resp):
+        return {(r["skill_id"], r["intent_name"], r["lang"]) for r in resp["intents"]}
+
+    def test_exact_match(self):
+        self.assertEqual(self._pairs(self._list(lang="en-US")),
+                         {("skill.weather", "current.weather", "en-US"),
+                          ("skill.time", "what.time", "en-US")})
+
+    def test_en_ca_falls_back_to_en_us(self):
+        resp = self._list(lang="en-CA")
+        self.assertTrue(resp["ok"])
+        # The rows keep their registered language: the client sees what it got.
+        self.assertEqual(self._pairs(resp),
+                         {("skill.weather", "current.weather", "en-US"),
+                          ("skill.time", "what.time", "en-US")})
+
+    def test_fr_ca_falls_back_to_fr_fr(self):
+        resp = self._list(lang="fr-CA", include_definitions=True)
+        self.assertEqual(self._pairs(resp),
+                         {("skill.weather", "current.weather", "fr-FR")})
+        self.assertEqual(resp["intents"][0]["definition"]["samples"], ["quel temps fait-il"])
+
+    def test_exact_match_wins_over_a_closer_sibling(self):
+        # With en-CA registered too, an en-CA client gets that and only that.
+        self.m._on_register(_reg("skill.weather", "current.weather", lang="en-CA",
+                                 method="template", samples=["what's the weather eh"]))
+        rows = [r for r in self._list(lang="en-CA")["intents"]
+                if r["skill_id"] == "skill.weather"]
+        self.assertEqual([r["lang"] for r in rows], ["en-CA"])
+
+    def test_resolved_per_intent(self):
+        # Another skill's dialect does not decide this one's: an intent
+        # registered only in en-GB is still listed next to en-US ones.
+        self.m._on_register(_reg("skill.news", "headlines", lang="en-GB"))
+        self.assertIn(("skill.news", "headlines", "en-GB"),
+                      self._pairs(self._list(lang="en-CA")))
+        self.assertIn(("skill.time", "what.time", "en-US"),
+                      self._pairs(self._list(lang="en-CA")))
+
+    def test_bare_tag_reaches_a_region(self):
+        self.assertEqual(self._pairs(self._list(lang="fr")),
+                         {("skill.weather", "current.weather", "fr-FR")})
+
+    def test_no_cross_language_leakage(self):
+        m = _manifest()
+        m._on_register(_reg("skill.a", "play", lang="en-US"))
+        replies = []
+        m.bus.on("ovos.intent.list.response", lambda msg: replies.append(msg))
+        m._on_list(Message("ovos.intent.list", data={"lang": "de"}))
+        self.assertEqual(replies[-1].data, {"ok": True, "intents": []})
+
+    def test_a_neighbouring_language_is_not_an_answer(self):
+        # Bosnian and Croatian are within the §2.2 distance threshold of each
+        # other, but a listing never answers in a language not asked for.
+        self.m._on_register(_reg("skill.a", "play", lang="hr-HR"))
+        self.assertEqual(self._list(lang="bs")["intents"], [])
+
+    def test_no_lang_still_lists_every_language(self):
+        self.assertEqual(len(self._list()["intents"]), 3)
+
+    def test_skill_filter_with_fallback(self):
+        self.assertEqual(self._pairs(self._list(lang="en-CA", skill_id="skill.time")),
+                         {("skill.time", "what.time", "en-US")})
+
+    def test_describe_falls_back(self):
+        resp = self._describe(skill_id="skill.weather", intent_name="current.weather",
+                              lang="fr-CA")
+        self.assertTrue(resp["ok"])
+        self.assertEqual(len(resp["definitions"]), 1)
+        self.assertEqual(resp["definitions"][0]["definition"]["lang"], "fr-FR")
+
+    def test_describe_exact_match_wins(self):
+        self.m._on_register(_reg("skill.weather", "current.weather", lang="en-CA",
+                                 method="template", samples=["what's the weather eh"]))
+        resp = self._describe(skill_id="skill.weather", intent_name="current.weather",
+                              lang="en-CA")
+        self.assertEqual([d["definition"]["lang"] for d in resp["definitions"]], ["en-CA"])
+
+    def test_describe_no_cross_language_leakage(self):
+        resp = self._describe(skill_id="skill.weather", intent_name="current.weather",
+                              lang="de-DE")
+        self.assertFalse(resp["ok"])
+
+    def test_required_slots_follow_the_fallback(self):
+        # The §6.2 backstop asks with the utterance's language, which is the
+        # client's own dialect, not the one the skill registered.
+        self.assertEqual(self.m.get_required_slots("default", "skill.time", "what.time",
+                                                   "en-CA"), ["location"])
+        self.assertEqual(self.m.get_required_slots("default", "skill.time", "what.time",
+                                                   "de-DE"), [])

@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import FrozenSet, List, Optional, Tuple, Union
+from typing import Dict, FrozenSet, Iterable, List, Optional, Tuple, Union
 
 from ovos_bus_client.client import MessageBusClient
 from ovos_bus_client.message import Message
-from ovos_spec_tools import REGISTERED_TYPES, standardize_lang
+from ovos_spec_tools import REGISTERED_TYPES, closest_lang, standardize_lang
 from ovos_spec_tools import declared_slot_types as template_slot_types
 from ovos_utils.fakebus import FakeBus
 from ovos_utils.log import LOG
@@ -103,6 +103,11 @@ class IntentManifest:
     so one query covers a whole skill. A client that wants every intent's
     sentences asks once per skill instead of once per intent per language,
     and the reply is still bounded by the skill it named.
+
+    A ``lang`` asked of any lookup is resolved per intent the way utterance
+    matching resolves it (see :meth:`_resolve_lang`): an intent registered
+    only as ``en-US`` is listed and described for an ``en-CA`` client, and
+    its rows keep their registered ``lang`` so the client sees what it got.
     """
 
     def __init__(self, bus: Union[MessageBusClient, FakeBus]):
@@ -143,6 +148,52 @@ class IntentManifest:
     def _key(session_id: str, skill_id: str, intent_name: str,
               lang: str, method: str) -> Tuple[str, str, str, str, str]:
         return session_id, skill_id, intent_name, standardize_lang(lang), method
+
+    @staticmethod
+    def _resolve_lang(lang: str, registered: Iterable[str]) -> Optional[str]:
+        """The registered language that answers a lookup in *lang*.
+
+        The same OVOS-INTENT-2 §2.2 fallback utterance matching applies
+        (``ovos_spec_tools.closest_lang``, which the adapt, padatious and
+        padacioso engines and ovos-m2v-pipeline's per-label resolution all
+        call): an exact match wins, otherwise the nearest registered region,
+        so ``en-CA`` reaches ``en-US`` and ``fr-CA`` reaches ``fr-FR``.
+
+        Candidates are narrowed to *lang*'s primary subtag first. The
+        language distance alone would admit a neighbouring language
+        (``bs`` against ``hr`` is within the threshold); the manifest never
+        answers in a language that was not asked for.
+
+        Returns ``None`` when nothing registered is close enough.
+        """
+        lang = standardize_lang(lang)
+        primary = lang.split("-")[0].lower()
+        candidates = sorted({r for r in registered
+                             if r.split("-")[0].lower() == primary})
+        return closest_lang(lang, candidates)
+
+    @classmethod
+    def _in_answering_lang(cls, entries: List[dict], lang: str) -> List[dict]:
+        """Keep the *entries* registered in the language that answers *lang*,
+        resolved per ``(skill_id, intent_name)`` the way ovos-m2v-pipeline
+        resolves each label: an intent registered in a single dialect keeps
+        it whatever dialects other skills use."""
+        by_intent: Dict[Tuple[str, str], set] = {}
+        for entry in entries:
+            by_intent.setdefault((entry["skill_id"], entry["intent_name"]),
+                                 set()).add(entry["lang"])
+        answering = {intent: cls._resolve_lang(lang, langs)
+                     for intent, langs in by_intent.items()}
+        return [e for e in entries
+                if e["lang"] == answering[(e["skill_id"], e["intent_name"])]]
+
+    def _intent_entries(self, session_id: str, skill_id: str, intent_name: str,
+                        lang: Optional[str]) -> List[dict]:
+        """One intent's entries in the session's effective pool (§11.2),
+        narrowed to the language answering *lang* when one is given."""
+        entries = [e for e in self._effective_pool(session_id)
+                   if e["skill_id"] == skill_id and e["intent_name"] == intent_name]
+        return self._in_answering_lang(entries, lang) if lang else entries
 
     def _effective_pool(self, session_id: str) -> List[dict]:
         """Return entries for *session_id* merged with 'default' (§11.2)."""
@@ -200,12 +251,8 @@ class IntentManifest:
         Returns ``[]`` when the intent is not in the manifest (e.g. registered via
         a legacy in-process path), leaving engine-side enforcement authoritative.
         """
-        lang = standardize_lang(lang)
         slots: list = []
-        for entry in self._effective_pool(session_id):
-            if (entry["skill_id"] != skill_id or entry["intent_name"] != intent_name
-                    or entry["lang"] != lang):
-                continue
+        for entry in self._intent_entries(session_id, skill_id, intent_name, lang):
             for slot in (entry.get("definition") or {}).get("required_slots") or []:
                 if slot not in slots:
                     slots.append(slot)
@@ -379,16 +426,14 @@ class IntentManifest:
         f_skill = message.data.get("skill_id")
         f_lang = message.data.get("lang")
         f_session = message.data.get("session_id")
-        if f_lang:
-            f_lang = standardize_lang(f_lang)
 
         pool = self._effective_pool(f_session) if f_session else list(self._index.values())
+        if f_skill:
+            pool = [e for e in pool if e["skill_id"] == f_skill]
+        if f_lang:
+            pool = self._in_answering_lang(pool, f_lang)
         results = []
         for entry in pool:
-            if f_skill and entry["skill_id"] != f_skill:
-                continue
-            if f_lang and entry["lang"] != f_lang:
-                continue
             results.append({k: entry[k] for k in
                             ("skill_id", "intent_name", "lang", "method", "enabled", "session_id")})
 
@@ -422,20 +467,21 @@ class IntentManifest:
             self.bus.emit(message.reply("ovos.intent.describe.response",
                                         {"ok": False, "error": "skill_id is required"}))
             return
-        if lang:
-            lang = standardize_lang(lang)
-        definitions = []
+        entries = []
         for entry in self._index.values():
             if entry["skill_id"] != skill_id:
                 continue
             if intent_name and entry["intent_name"] != intent_name:
                 continue
-            if lang and entry["lang"] != lang:
-                continue
             if method_filter and entry["method"] != method_filter:
                 continue
             if session_filter is not None and entry["session_id"] != session_filter:
                 continue
+            entries.append(entry)
+        if lang:
+            entries = self._in_answering_lang(entries, lang)
+        definitions = []
+        for entry in entries:
             row = {k: entry[k] for k in
                    ("skill_id", "intent_name", "lang", "method", "session_id")}
             row["definition"] = entry["definition"]
@@ -460,15 +506,8 @@ class IntentManifest:
 
     def _matching_definitions(self, session_id: str, skill_id: str,
                               intent_name: str, lang: Optional[str]) -> List[dict]:
-        lang = standardize_lang(lang) if lang else None
-        out = []
-        for entry in self._effective_pool(session_id):
-            if entry["skill_id"] != skill_id or entry["intent_name"] != intent_name:
-                continue
-            if lang and entry["lang"] != lang:
-                continue
-            out.append(entry.get("definition") or {})
-        return out
+        return [entry.get("definition") or {}
+                for entry in self._intent_entries(session_id, skill_id, intent_name, lang)]
 
     def get_context_requirements(self, session_id: str, skill_id: str,
                                  intent_name: str, lang: Optional[str] = None
